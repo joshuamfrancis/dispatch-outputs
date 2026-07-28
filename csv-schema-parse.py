@@ -3,27 +3,32 @@ csv_schema_parser.py
 
 Given a top-level directory, recursively walks it and all subdirectories to
 find every .csv file, then derives a lightweight "schema" for each one: the
-header row, an inferred type per column, a handful of sample values per
-column, and a short plain-English description of each column.
+header row, an inferred type per column, a sample value per column, and a
+short plain-English description of each column. The result is written out
+as a single human-readable text file containing a markdown-style table per
+CSV file found.
 
-Uses ONLY the Python standard library (csv, json, argparse, pathlib,
-dataclasses, datetime, logging) -- no third-party dependencies required.
+Uses ONLY the Python standard library (csv, argparse, pathlib, dataclasses,
+datetime, logging) -- no third-party dependencies required.
 
 Usage as a script:
-    python csv_schema_parser.py /path/to/top_level_dir -o schema.json -t report.txt
+    python csv_schema_parser.py /path/to/top_level_dir -o schema_report.txt
     python csv_schema_parser.py /path/to/top_level_dir --samples 10 --debug
 
 Usage as a module:
-    from csv_schema_parser import parse_directory, parse_file
+    from csv_schema_parser import parse_directory, parse_file, save_text_report
 
-    schema = parse_directory("./data")          # recurses through ./data/**
-    schema = parse_file("./data/sub/sales.csv") # parse a single file
+    schemas = parse_directory("./data")          # recurses through ./data/**
+    schema = parse_file("./data/sub/sales.csv")  # parse a single file
+    save_text_report(schemas, "schema_report.txt")
 
-Outputs:
-    - A JSON schema file (machine-readable), via save_schema().
-    - A plain-text report (human-readable), via save_text_report(), listing
-      each file's original path/name and, per column: the column name,
-      sample values, and a short description of the inferred content.
+Output format (one block per file):
+
+    {{file path/filename}}
+    |column number| column name| sample value| description|
+    |--------------------|------------------|------------------|---------------|
+    |1|OrderID|1|Whole-number (integer) values, e.g. 1.|
+    ...
 
 Design notes:
     - `parse_directory` always recurses -- it walks the given top-level
@@ -36,9 +41,11 @@ Design notes:
       classified as int, float, bool, datetime (a small set of common
       formats), or str; a column's inferred_type is the single type shared
       by all its sample values, "mixed" if they disagree, or "empty" if the
-      column had no non-blank values in the sampled rows.
+      column had no non-blank values in the sampled rows. Internally several
+      sample values are collected per column to make that inference robust,
+      even though only the first one is shown in the report.
     - A file that fails to open/parse (bad encoding, malformed CSV, etc.) is
-      recorded with an "error" key instead of raising, so one bad file
+      reported with an error line instead of raising, so one bad file
       doesn't stop the whole batch.
     - Debug-level logging traces execution step by step (file discovery,
       dialect sniffing, header detection, per-row sampling, per-column type
@@ -51,9 +58,8 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
-import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -138,13 +144,13 @@ def _classify_scalar(raw: str) -> tuple[str, Any]:
     return "str", value
 
 
-def _describe_column(name: str, inferred_type: str, samples: list[Any]) -> str:
+def _describe_column(inferred_type: str, sample: Any) -> str:
     """Build a short, plain-English description of a column from its inferred
-    type and sample values."""
-    example = ", ".join(str(v) for v in samples[:3]) if samples else ""
+    type and single representative sample value."""
+    example = "" if sample is None else str(sample)
 
     if inferred_type == "empty":
-        return "No non-blank sample values were found; column may be empty or sparsely populated."
+        return "No non-blank sample value found; column may be empty or sparsely populated."
     if inferred_type == "int":
         return f"Whole-number (integer) values, e.g. {example}."
     if inferred_type == "float":
@@ -253,7 +259,8 @@ def parse_file(file_path: str | Path, sample_size: int = 5, encoding: str = "utf
             columns = []
             for i, name in enumerate(headers):
                 inferred_type, coerced_samples = _infer_column(samples_per_col[i])
-                description = _describe_column(name, inferred_type, coerced_samples)
+                first_sample = coerced_samples[0] if coerced_samples else None
+                description = _describe_column(inferred_type, first_sample)
                 logger.debug(
                     "Column %d (%r) in %s inferred as %r with %d sample value(s)",
                     i + 1, name, file_path, inferred_type, len(coerced_samples),
@@ -312,63 +319,51 @@ def parse_directory(
 
 
 # --------------------------------------------------------------------------- #
-# Serialization helpers
+# Report generation
 # --------------------------------------------------------------------------- #
 
-def schemas_to_dict(schemas: list[FileSchema]) -> list[dict]:
-    return [asdict(s) for s in schemas]
-
-
-def save_schema(schemas: list[FileSchema], output_path: str | Path) -> None:
-    output_path = Path(output_path)
-    logger.debug("Serializing %d file schema(s) to JSON", len(schemas))
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(schemas_to_dict(schemas), f, indent=2)
-    logger.info("Wrote JSON schema for %d file(s) to %s", len(schemas), output_path)
+def _escape_cell(value: Any) -> str:
+    """Escape a value for safe use inside a markdown table cell."""
+    text = "" if value is None else str(value)
+    return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
 def save_text_report(schemas: list[FileSchema], output_path: str | Path) -> None:
-    """Write a human-readable text report: one section per file, showing the
-    original path/name and, per column, the column name, sample values, and
-    a short description."""
+    """Write a human-readable text report: one markdown-style table per file,
+    showing the original path/filename followed by a table of column number,
+    column name, a single sample value, and a short description."""
     output_path = Path(output_path)
-    logger.debug("Building text report for %d file(s)", len(schemas))
+    logger.debug("Building text table report for %d file(s)", len(schemas))
 
     lines: list[str] = []
-    lines.append("CSV SCHEMA REPORT")
-    lines.append(f"Files discovered: {len(schemas)}")
-    lines.append("=" * 80)
 
     for schema in schemas:
-        lines.append("")
-        lines.append(f"File: {schema.file_name}")
-        lines.append(f"Path: {schema.file_path}")
+        lines.append(schema.file_path)
 
         if schema.error:
-            lines.append(f"ERROR: {schema.error}")
-            lines.append("-" * 80)
+            lines.append(f"  ERROR: {schema.error}")
+            lines.append("")
             continue
-
-        lines.append(f"Delimiter: {schema.delimiter!r}    Columns: {schema.column_count}    Data rows: {schema.row_count}")
-        lines.append("-" * 80)
 
         if not schema.columns:
-            lines.append("(no columns detected -- file may be empty)")
-            lines.append("-" * 80)
+            lines.append("  (no columns detected -- file may be empty)")
+            lines.append("")
             continue
 
+        lines.append("|column number| column name| sample value| description|")
+        lines.append("|--------------------|------------------|------------------|---------------|")
         for col in schema.columns:
-            sample_str = ", ".join(str(v) for v in col.sample_values) if col.sample_values else "(none)"
-            lines.append(f"  Column {col.column_index}: {col.name}  [{col.inferred_type}]")
-            lines.append(f"    Sample values: {sample_str}")
-            lines.append(f"    Description:   {col.description}")
+            sample = col.sample_values[0] if col.sample_values else ""
+            lines.append(
+                f"|{col.column_index}|{_escape_cell(col.name)}|{_escape_cell(sample)}|{_escape_cell(col.description)}|"
+            )
+        lines.append("")
+        logger.debug("Added table for %s (%d column rows)", schema.file_path, len(schema.columns))
 
-        lines.append("-" * 80)
-
-    report_text = "\n".join(lines) + "\n"
+    report_text = "\n".join(lines).rstrip() + "\n"
     with output_path.open("w", encoding="utf-8") as f:
         f.write(report_text)
-    logger.info("Wrote text report for %d file(s) to %s", len(schemas), output_path)
+    logger.info("Wrote text table report for %d file(s) to %s", len(schemas), output_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -381,14 +376,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("directory", help="Top-level directory to search (recursively) for .csv files")
     parser.add_argument(
-        "-o", "--output", default="schema.json", help="Path to write the JSON schema (default: schema.json)"
+        "-o", "--output", default="schema_report.txt",
+        help="Path to write the text table report (default: schema_report.txt)",
     )
     parser.add_argument(
-        "-t", "--text-report", default="schema_report.txt",
-        help="Path to write the human-readable text report (default: schema_report.txt)",
-    )
-    parser.add_argument(
-        "-s", "--samples", type=int, default=5, help="Number of sample values to capture per column (default: 5)"
+        "-s", "--samples", type=int, default=5, help="Number of sample values to inspect per column (default: 5)"
     )
     parser.add_argument(
         "-e", "--encoding", default="utf-8-sig", help="File encoding to use when reading CSVs (default: utf-8-sig)"
@@ -420,8 +412,7 @@ def main(argv: list[str] | None = None) -> int:
         sample_size=args.samples,
         encoding=args.encoding,
     )
-    save_schema(schemas, args.output)
-    save_text_report(schemas, args.text_report)
+    save_text_report(schemas, args.output)
 
     # Brief console summary
     for s in schemas:
