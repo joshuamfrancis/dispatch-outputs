@@ -1,24 +1,28 @@
 """
 csv_schema_parser.py
 
-Scans a directory for CSV files and, for each file, derives a lightweight
-"schema": the header row, an inferred type per column, and a handful of
-sample values per column.
+Given a top-level directory, recursively walks it and all subdirectories to
+find every .csv file, then derives a lightweight "schema" for each one: the
+header row, an inferred type per column, and a handful of sample values per
+column.
 
 Uses ONLY the Python standard library (csv, json, argparse, pathlib,
 dataclasses, datetime) -- no third-party dependencies required.
 
 Usage as a script:
-    python csv_schema_parser.py /path/to/csvs -o schema.json
-    python csv_schema_parser.py /path/to/csvs --samples 10 --recursive
+    python csv_schema_parser.py /path/to/top_level_dir -o schema.json
+    python csv_schema_parser.py /path/to/top_level_dir --samples 10
 
 Usage as a module:
     from csv_schema_parser import parse_directory, parse_file
 
-    schema = parse_directory("./data", sample_size=5)
-    schema = parse_file("./data/sales.csv", sample_size=5)
+    schema = parse_directory("./data")          # recurses through ./data/**
+    schema = parse_file("./data/sub/sales.csv") # parse a single file
 
 Design notes:
+    - `parse_directory` always recurses -- it walks the given top-level
+      directory plus every subdirectory beneath it (any depth) collecting
+      .csv files.
     - Delimiter/dialect is auto-detected per file via csv.Sniffer, with a
       comma-delimited fallback if sniffing fails (e.g. very small files).
     - The header row is assumed to be the first non-blank row in the file.
@@ -228,24 +232,24 @@ def parse_directory(
     directory: str | Path,
     sample_size: int = 5,
     extensions: Iterable[str] = DEFAULT_EXTENSIONS,
-    recursive: bool = False,
     encoding: str = "utf-8-sig",
 ) -> list[FileSchema]:
-    """Parse every CSV file in `directory` matching `extensions`.
+    """Recursively parse every CSV file found under `directory`.
 
-    Returns a list of FileSchema, one per file found.
+    Walks `directory` and all of its subdirectories (at any depth) looking
+    for files matching `extensions`. Returns a list of FileSchema, one per
+    file found, sorted by path.
     """
     directory = Path(directory)
     if not directory.is_dir():
         raise NotADirectoryError(f"{directory} is not a directory")
 
-    glob_fn = directory.rglob if recursive else directory.glob
     files: list[Path] = []
     for ext in extensions:
-        files.extend(glob_fn(f"*{ext}"))
+        files.extend(directory.rglob(f"*{ext}"))
 
     files = sorted(set(files))
-    logger.info("Found %d CSV file(s) in %s", len(files), directory)
+    logger.info("Found %d CSV file(s) under %s (including subdirectories)", len(files), directory)
 
     return [parse_file(f, sample_size=sample_size, encoding=encoding) for f in files]
 
@@ -273,15 +277,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Parse CSV files in a directory and emit a header/sample-value schema."
     )
-    parser.add_argument("directory", help="Directory containing .csv files")
+    parser.add_argument("directory", help="Top-level directory to search (recursively) for .csv files")
     parser.add_argument(
         "-o", "--output", default="schema.json", help="Path to write the resulting JSON schema (default: schema.json)"
     )
     parser.add_argument(
         "-s", "--samples", type=int, default=5, help="Number of sample values to capture per column (default: 5)"
-    )
-    parser.add_argument(
-        "-r", "--recursive", action="store_true", help="Recurse into subdirectories"
     )
     parser.add_argument(
         "-e", "--encoding", default="utf-8-sig", help="File encoding to use when reading CSVs (default: utf-8-sig)"
@@ -299,7 +300,6 @@ def main(argv: list[str] | None = None) -> int:
     schemas = parse_directory(
         args.directory,
         sample_size=args.samples,
-        recursive=args.recursive,
         encoding=args.encoding,
     )
     save_schema(schemas, args.output)
