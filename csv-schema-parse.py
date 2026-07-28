@@ -3,21 +3,27 @@ csv_schema_parser.py
 
 Given a top-level directory, recursively walks it and all subdirectories to
 find every .csv file, then derives a lightweight "schema" for each one: the
-header row, an inferred type per column, and a handful of sample values per
-column.
+header row, an inferred type per column, a handful of sample values per
+column, and a short plain-English description of each column.
 
 Uses ONLY the Python standard library (csv, json, argparse, pathlib,
-dataclasses, datetime) -- no third-party dependencies required.
+dataclasses, datetime, logging) -- no third-party dependencies required.
 
 Usage as a script:
-    python csv_schema_parser.py /path/to/top_level_dir -o schema.json
-    python csv_schema_parser.py /path/to/top_level_dir --samples 10
+    python csv_schema_parser.py /path/to/top_level_dir -o schema.json -t report.txt
+    python csv_schema_parser.py /path/to/top_level_dir --samples 10 --debug
 
 Usage as a module:
     from csv_schema_parser import parse_directory, parse_file
 
     schema = parse_directory("./data")          # recurses through ./data/**
     schema = parse_file("./data/sub/sales.csv") # parse a single file
+
+Outputs:
+    - A JSON schema file (machine-readable), via save_schema().
+    - A plain-text report (human-readable), via save_text_report(), listing
+      each file's original path/name and, per column: the column name,
+      sample values, and a short description of the inferred content.
 
 Design notes:
     - `parse_directory` always recurses -- it walks the given top-level
@@ -34,6 +40,10 @@ Design notes:
     - A file that fails to open/parse (bad encoding, malformed CSV, etc.) is
       recorded with an "error" key instead of raising, so one bad file
       doesn't stop the whole batch.
+    - Debug-level logging traces execution step by step (file discovery,
+      dialect sniffing, header detection, per-row sampling, per-column type
+      inference). Enable with --debug on the CLI, or logging.DEBUG when used
+      as a library.
 """
 
 from __future__ import annotations
@@ -78,6 +88,7 @@ class ColumnSchema:
     column_index: int  # 1-based
     inferred_type: str
     sample_values: list[Any] = field(default_factory=list)
+    description: str = ""
 
 
 @dataclass
@@ -127,6 +138,27 @@ def _classify_scalar(raw: str) -> tuple[str, Any]:
     return "str", value
 
 
+def _describe_column(name: str, inferred_type: str, samples: list[Any]) -> str:
+    """Build a short, plain-English description of a column from its inferred
+    type and sample values."""
+    example = ", ".join(str(v) for v in samples[:3]) if samples else ""
+
+    if inferred_type == "empty":
+        return "No non-blank sample values were found; column may be empty or sparsely populated."
+    if inferred_type == "int":
+        return f"Whole-number (integer) values, e.g. {example}."
+    if inferred_type == "float":
+        return f"Decimal (floating-point) number values, e.g. {example}."
+    if inferred_type == "bool":
+        return f"Boolean true/false values, e.g. {example}."
+    if inferred_type == "datetime":
+        return f"Date/time values, e.g. {example}."
+    if inferred_type == "mixed":
+        return f"Values of mixed/inconsistent types, e.g. {example}."
+    # str / fallback
+    return f"Text (string) values, e.g. {example}."
+
+
 def _infer_column(raw_values: Iterable[str]) -> tuple[str, list[Any]]:
     """Given raw string samples for one column, return (inferred_type, coerced_samples)."""
     types_seen = set()
@@ -150,14 +182,18 @@ def _infer_column(raw_values: Iterable[str]) -> tuple[str, list[Any]]:
 
 def _sniff_dialect(sample_text: str) -> csv.Dialect:
     try:
-        return csv.Sniffer().sniff(sample_text, delimiters=",;\t|")
+        dialect = csv.Sniffer().sniff(sample_text, delimiters=",;\t|")
+        logger.debug("Sniffer detected dialect with delimiter %r", dialect.delimiter)
+        return dialect
     except csv.Error:
+        logger.debug("Sniffer could not determine dialect; falling back to comma-delimited")
         return csv.excel  # sensible comma-delimited default
 
 
 def parse_file(file_path: str | Path, sample_size: int = 5, encoding: str = "utf-8-sig") -> FileSchema:
     """Parse a single CSV file into a FileSchema."""
     file_path = Path(file_path)
+    logger.debug("Opening file: %s (encoding=%s)", file_path, encoding)
     schema = FileSchema(
         file_name=file_path.name,
         file_path=str(file_path),
@@ -173,6 +209,7 @@ def parse_file(file_path: str | Path, sample_size: int = 5, encoding: str = "utf
             f.seek(0)
             dialect = _sniff_dialect(sample_text)
             schema.delimiter = dialect.delimiter
+            logger.debug("Detected delimiter %r for %s", dialect.delimiter, file_path)
 
             reader = csv.reader(f, dialect)
 
@@ -183,40 +220,51 @@ def parse_file(file_path: str | Path, sample_size: int = 5, encoding: str = "utf
                 if any(cell.strip() != "" for cell in row):
                     headers = row
                     header_row_num = i
+                    logger.debug("Header row found at line %d in %s: %r", i, file_path, row)
                     break
+                logger.debug("Skipping blank line %d in %s", i, file_path)
 
             if headers is None:
-                # File is entirely blank.
+                logger.debug("No non-blank rows found in %s; treating as empty file", file_path)
                 return schema
 
             headers = [h.strip() if h.strip() != "" else f"Column_{idx}" for idx, h in enumerate(headers, start=1)]
             column_count = len(headers)
             schema.header_row = header_row_num
             schema.column_count = column_count
+            logger.debug("Parsed %d header(s) from %s: %r", column_count, file_path, headers)
 
             samples_per_col: list[list[str]] = [[] for _ in range(column_count)]
             data_row_count = 0
 
-            for row in reader:
+            for row_num, row in enumerate(reader, start=header_row_num + 1):
                 if not any(cell.strip() != "" for cell in row):
+                    logger.debug("Skipping blank data row at line %d in %s", row_num, file_path)
                     continue  # skip fully blank rows
                 data_row_count += 1
                 for col_idx in range(column_count):
                     raw = row[col_idx] if col_idx < len(row) else ""
                     if raw.strip() != "" and len(samples_per_col[col_idx]) < sample_size:
                         samples_per_col[col_idx].append(raw)
+            logger.debug("Read %d data row(s) from %s", data_row_count, file_path)
 
             schema.row_count = data_row_count
 
             columns = []
             for i, name in enumerate(headers):
                 inferred_type, coerced_samples = _infer_column(samples_per_col[i])
+                description = _describe_column(name, inferred_type, coerced_samples)
+                logger.debug(
+                    "Column %d (%r) in %s inferred as %r with %d sample value(s)",
+                    i + 1, name, file_path, inferred_type, len(coerced_samples),
+                )
                 columns.append(
                     ColumnSchema(
                         name=name,
                         column_index=i + 1,
                         inferred_type=inferred_type,
                         sample_values=coerced_samples,
+                        description=description,
                     )
                 )
             schema.columns = columns
@@ -225,6 +273,7 @@ def parse_file(file_path: str | Path, sample_size: int = 5, encoding: str = "utf
         logger.warning("Failed to parse %s: %s", file_path, exc)
         schema.error = f"{type(exc).__name__}: {exc}"
 
+    logger.debug("Finished parsing %s: %d column(s), %d data row(s)", file_path, schema.column_count, schema.row_count)
     return schema
 
 
@@ -244,14 +293,22 @@ def parse_directory(
     if not directory.is_dir():
         raise NotADirectoryError(f"{directory} is not a directory")
 
+    logger.debug("Beginning recursive scan of %s for extensions %s", directory, extensions)
     files: list[Path] = []
     for ext in extensions:
-        files.extend(directory.rglob(f"*{ext}"))
+        matches = list(directory.rglob(f"*{ext}"))
+        logger.debug("Found %d file(s) matching *%s under %s", len(matches), ext, directory)
+        files.extend(matches)
 
     files = sorted(set(files))
     logger.info("Found %d CSV file(s) under %s (including subdirectories)", len(files), directory)
 
-    return [parse_file(f, sample_size=sample_size, encoding=encoding) for f in files]
+    schemas: list[FileSchema] = []
+    for idx, f in enumerate(files, start=1):
+        logger.debug("Parsing file %d/%d: %s", idx, len(files), f)
+        schemas.append(parse_file(f, sample_size=sample_size, encoding=encoding))
+
+    return schemas
 
 
 # --------------------------------------------------------------------------- #
@@ -264,9 +321,54 @@ def schemas_to_dict(schemas: list[FileSchema]) -> list[dict]:
 
 def save_schema(schemas: list[FileSchema], output_path: str | Path) -> None:
     output_path = Path(output_path)
+    logger.debug("Serializing %d file schema(s) to JSON", len(schemas))
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(schemas_to_dict(schemas), f, indent=2)
-    logger.info("Wrote schema for %d file(s) to %s", len(schemas), output_path)
+    logger.info("Wrote JSON schema for %d file(s) to %s", len(schemas), output_path)
+
+
+def save_text_report(schemas: list[FileSchema], output_path: str | Path) -> None:
+    """Write a human-readable text report: one section per file, showing the
+    original path/name and, per column, the column name, sample values, and
+    a short description."""
+    output_path = Path(output_path)
+    logger.debug("Building text report for %d file(s)", len(schemas))
+
+    lines: list[str] = []
+    lines.append("CSV SCHEMA REPORT")
+    lines.append(f"Files discovered: {len(schemas)}")
+    lines.append("=" * 80)
+
+    for schema in schemas:
+        lines.append("")
+        lines.append(f"File: {schema.file_name}")
+        lines.append(f"Path: {schema.file_path}")
+
+        if schema.error:
+            lines.append(f"ERROR: {schema.error}")
+            lines.append("-" * 80)
+            continue
+
+        lines.append(f"Delimiter: {schema.delimiter!r}    Columns: {schema.column_count}    Data rows: {schema.row_count}")
+        lines.append("-" * 80)
+
+        if not schema.columns:
+            lines.append("(no columns detected -- file may be empty)")
+            lines.append("-" * 80)
+            continue
+
+        for col in schema.columns:
+            sample_str = ", ".join(str(v) for v in col.sample_values) if col.sample_values else "(none)"
+            lines.append(f"  Column {col.column_index}: {col.name}  [{col.inferred_type}]")
+            lines.append(f"    Sample values: {sample_str}")
+            lines.append(f"    Description:   {col.description}")
+
+        lines.append("-" * 80)
+
+    report_text = "\n".join(lines) + "\n"
+    with output_path.open("w", encoding="utf-8") as f:
+        f.write(report_text)
+    logger.info("Wrote text report for %d file(s) to %s", len(schemas), output_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -279,7 +381,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("directory", help="Top-level directory to search (recursively) for .csv files")
     parser.add_argument(
-        "-o", "--output", default="schema.json", help="Path to write the resulting JSON schema (default: schema.json)"
+        "-o", "--output", default="schema.json", help="Path to write the JSON schema (default: schema.json)"
+    )
+    parser.add_argument(
+        "-t", "--text-report", default="schema_report.txt",
+        help="Path to write the human-readable text report (default: schema_report.txt)",
     )
     parser.add_argument(
         "-s", "--samples", type=int, default=5, help="Number of sample values to capture per column (default: 5)"
@@ -290,12 +396,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose (INFO-level) logging"
     )
+    parser.add_argument(
+        "-d", "--debug", action="store_true", help="Enable debug-level logging (step-by-step execution trace)"
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s: %(message)s")
+
+    if args.debug:
+        level = logging.DEBUG
+    elif args.verbose:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+
+    logger.debug("Starting run with args: %s", vars(args))
 
     schemas = parse_directory(
         args.directory,
@@ -303,6 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         encoding=args.encoding,
     )
     save_schema(schemas, args.output)
+    save_text_report(schemas, args.text_report)
 
     # Brief console summary
     for s in schemas:
@@ -311,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         print(f"{s.file_name}: {s.column_count} columns, {s.row_count} data rows (delimiter='{s.delimiter}')")
 
+    logger.debug("Run complete")
     return 0
 
 
