@@ -2,17 +2,16 @@
 csv_schema_parser.py
 
 Given a top-level directory, recursively walks it and all subdirectories to
-find every .csv file, then derives a lightweight "schema" for each one: the
-header row, an inferred type per column, a sample value per column, and a
-short plain-English description of each column. The result is written out
-as a single human-readable text file containing a markdown-style table per
-CSV file found.
+find every .csv file, then derives a lightweight schema for each one: the
+header row and a sample value per column. The result is written out as a
+single markdown (.md) file, with one section per CSV file found -- the
+file's path/name as a heading, followed by a table of its columns.
 
 Uses ONLY the Python standard library (csv, argparse, pathlib, dataclasses,
 datetime, logging) -- no third-party dependencies required.
 
 Usage as a script:
-    python csv_schema_parser.py /path/to/top_level_dir -o schema_report.txt
+    python csv_schema_parser.py /path/to/top_level_dir -o schema_report.md
     python csv_schema_parser.py /path/to/top_level_dir --samples 10 --debug
 
 Usage as a module:
@@ -20,14 +19,15 @@ Usage as a module:
 
     schemas = parse_directory("./data")          # recurses through ./data/**
     schema = parse_file("./data/sub/sales.csv")  # parse a single file
-    save_text_report(schemas, "schema_report.txt")
+    save_text_report(schemas, "schema_report.md")
 
-Output format (one block per file):
+Output format (one section per file):
 
-    {{file path/filename}}
-    |column number| column name| sample value| description|
-    |--------------------|------------------|------------------|---------------|
-    |1|OrderID|1|Whole-number (integer) values, e.g. 1.|
+    ## {{file path/filename}}
+
+    |column number| column name| sample value|
+    |--------------------|------------------|------------------|
+    |1|OrderID|1|
     ...
 
 Design notes:
@@ -39,11 +39,9 @@ Design notes:
     - The header row is assumed to be the first non-blank row in the file.
     - Since CSV values are always strings, each value is inspected and
       classified as int, float, bool, datetime (a small set of common
-      formats), or str; a column's inferred_type is the single type shared
-      by all its sample values, "mixed" if they disagree, or "empty" if the
-      column had no non-blank values in the sampled rows. Internally several
-      sample values are collected per column to make that inference robust,
-      even though only the first one is shown in the report.
+      formats), or str, purely to pick a representative sample value;
+      several sample values are collected per column internally, but only
+      the first is shown in the report.
     - A file that fails to open/parse (bad encoding, malformed CSV, etc.) is
       reported with an error line instead of raising, so one bad file
       doesn't stop the whole batch.
@@ -94,7 +92,6 @@ class ColumnSchema:
     column_index: int  # 1-based
     inferred_type: str
     sample_values: list[Any] = field(default_factory=list)
-    description: str = ""
 
 
 @dataclass
@@ -102,7 +99,6 @@ class FileSchema:
     file_name: str
     file_path: str
     delimiter: str
-    header_row: int
     row_count: int
     column_count: int
     columns: list[ColumnSchema] = field(default_factory=list)
@@ -144,27 +140,6 @@ def _classify_scalar(raw: str) -> tuple[str, Any]:
     return "str", value
 
 
-def _describe_column(inferred_type: str, sample: Any) -> str:
-    """Build a short, plain-English description of a column from its inferred
-    type and single representative sample value."""
-    example = "" if sample is None else str(sample)
-
-    if inferred_type == "empty":
-        return "No non-blank sample value found; column may be empty or sparsely populated."
-    if inferred_type == "int":
-        return f"Whole-number (integer) values, e.g. {example}."
-    if inferred_type == "float":
-        return f"Decimal (floating-point) number values, e.g. {example}."
-    if inferred_type == "bool":
-        return f"Boolean true/false values, e.g. {example}."
-    if inferred_type == "datetime":
-        return f"Date/time values, e.g. {example}."
-    if inferred_type == "mixed":
-        return f"Values of mixed/inconsistent types, e.g. {example}."
-    # str / fallback
-    return f"Text (string) values, e.g. {example}."
-
-
 def _infer_column(raw_values: Iterable[str]) -> tuple[str, list[Any]]:
     """Given raw string samples for one column, return (inferred_type, coerced_samples)."""
     types_seen = set()
@@ -204,7 +179,6 @@ def parse_file(file_path: str | Path, sample_size: int = 5, encoding: str = "utf
         file_name=file_path.name,
         file_path=str(file_path),
         delimiter=",",
-        header_row=0,
         row_count=0,
         column_count=0,
     )
@@ -236,7 +210,6 @@ def parse_file(file_path: str | Path, sample_size: int = 5, encoding: str = "utf
 
             headers = [h.strip() if h.strip() != "" else f"Column_{idx}" for idx, h in enumerate(headers, start=1)]
             column_count = len(headers)
-            schema.header_row = header_row_num
             schema.column_count = column_count
             logger.debug("Parsed %d header(s) from %s: %r", column_count, file_path, headers)
 
@@ -259,8 +232,6 @@ def parse_file(file_path: str | Path, sample_size: int = 5, encoding: str = "utf
             columns = []
             for i, name in enumerate(headers):
                 inferred_type, coerced_samples = _infer_column(samples_per_col[i])
-                first_sample = coerced_samples[0] if coerced_samples else None
-                description = _describe_column(inferred_type, first_sample)
                 logger.debug(
                     "Column %d (%r) in %s inferred as %r with %d sample value(s)",
                     i + 1, name, file_path, inferred_type, len(coerced_samples),
@@ -271,7 +242,6 @@ def parse_file(file_path: str | Path, sample_size: int = 5, encoding: str = "utf
                         column_index=i + 1,
                         inferred_type=inferred_type,
                         sample_values=coerced_samples,
-                        description=description,
                     )
                 )
             schema.columns = columns
@@ -329,41 +299,40 @@ def _escape_cell(value: Any) -> str:
 
 
 def save_text_report(schemas: list[FileSchema], output_path: str | Path) -> None:
-    """Write a human-readable text report: one markdown-style table per file,
-    showing the original path/filename followed by a table of column number,
-    column name, a single sample value, and a short description."""
+    """Write a markdown report: one section per file, using the file's
+    path/name as a heading, followed by a table of column number, column
+    name, and a single sample value."""
     output_path = Path(output_path)
-    logger.debug("Building text table report for %d file(s)", len(schemas))
+    logger.debug("Building markdown table report for %d file(s)", len(schemas))
 
     lines: list[str] = []
 
     for schema in schemas:
-        lines.append(schema.file_path)
+        lines.append(f"## {schema.file_path}")
+        lines.append("")
 
         if schema.error:
-            lines.append(f"  ERROR: {schema.error}")
+            lines.append(f"**ERROR:** {schema.error}")
             lines.append("")
             continue
 
         if not schema.columns:
-            lines.append("  (no columns detected -- file may be empty)")
+            lines.append("_(no columns detected -- file may be empty)_")
             lines.append("")
             continue
 
-        lines.append("|column number| column name| sample value| description|")
-        lines.append("|--------------------|------------------|------------------|---------------|")
+        lines.append("|column number| column name| sample value|")
+        lines.append("|--------------------|------------------|------------------|")
         for col in schema.columns:
             sample = col.sample_values[0] if col.sample_values else ""
-            lines.append(
-                f"|{col.column_index}|{_escape_cell(col.name)}|{_escape_cell(sample)}|{_escape_cell(col.description)}|"
-            )
+            lines.append(f"|{col.column_index}|{_escape_cell(col.name)}|{_escape_cell(sample)}|")
         lines.append("")
         logger.debug("Added table for %s (%d column rows)", schema.file_path, len(schema.columns))
 
     report_text = "\n".join(lines).rstrip() + "\n"
     with output_path.open("w", encoding="utf-8") as f:
         f.write(report_text)
-    logger.info("Wrote text table report for %d file(s) to %s", len(schemas), output_path)
+    logger.info("Wrote markdown report for %d file(s) to %s", len(schemas), output_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -372,12 +341,12 @@ def save_text_report(schemas: list[FileSchema], output_path: str | Path) -> None
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Parse CSV files in a directory and emit a header/sample-value schema."
+        description="Recursively parse CSV files under a directory and emit a markdown schema report."
     )
     parser.add_argument("directory", help="Top-level directory to search (recursively) for .csv files")
     parser.add_argument(
-        "-o", "--output", default="schema_report.txt",
-        help="Path to write the text table report (default: schema_report.txt)",
+        "-o", "--output", default="schema_report.md",
+        help="Path to write the markdown table report (default: schema_report.md)",
     )
     parser.add_argument(
         "-s", "--samples", type=int, default=5, help="Number of sample values to inspect per column (default: 5)"
