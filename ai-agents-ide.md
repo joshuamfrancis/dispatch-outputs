@@ -1,3 +1,11 @@
+# prompt
+```text
+A team of 10 developers work on spring boot java maven project for rest apis with MySQL database, angular for the frontend ui.
+GitHub is used for source control and code, aws is used for hosting the application.eclipse is used as ide.
+What ai coding assistant can they use? What are the options, the pros and cons. Initial thoughts are copilot, divian.
+```
+
+
 # AI Coding Assistant Options for Spring Boot / Angular Team
 
 **Context:** 10 developers, Spring Boot + Java + Maven REST APIs, MySQL, Angular frontend, GitHub for source control, AWS for hosting, Eclipse as IDE.
