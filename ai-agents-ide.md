@@ -1,3 +1,17 @@
+
+# Prompt
+```text
+I have team of 10 developers who are developing an application with Angular front end, java spring-boot REST API backing services and MySQL as the data persistence layer.
+
+The source control and pipeline is with GitHub (Team plan)/Actions.
+IDE is eclipse
+Target runtime environment is AWS EC2 with Tomcat server.
+Task/Work board management not defined.
+
+Considering the setup, what AI coding agents can be used accelerate development? Provide the pros and cons for each option.
+Generate the output as Markdown file.
+```
+
 # AI Coding Agents for an Angular + Spring Boot + MySQL Team
 
 **Prepared:** 6 August 2026
