@@ -95,7 +95,7 @@ Removes the offload compromise: 32GB VRAM fits 33B at Q5/Q6 fully on GPU, plus r
 
 | Layer | Choice | Why |
 |---|---|---|
-| OS | **Ubuntu Server 24.04 LTS** | Matches your standard OS; best NVIDIA driver/CUDA support |
+| OS | **Ubuntu Server 26.04 LTS** ("Resolute Raccoon") | Current LTS as of 2026 (5-year support); Canonical calls out native NVIDIA CUDA and AMD ROCm support as a headline feature, plus a newer kernel (Linux 7.0) for better support on current-gen GPUs |
 | GPU drivers | NVIDIA driver 550+ / CUDA 12.4+ | Required for GGUF/vLLM GPU offload |
 | Containers | **Docker + NVIDIA Container Toolkit** | Matches your Docker-first preference |
 | Model runtime | **Ollama** (primary) — OpenAI-compatible API, easy GGUF model management | Simple to run in Docker, good default |
@@ -136,7 +136,7 @@ Either way: put the model API behind an API key *in addition to* the auth layer 
 
 ```bash
 # 1. OS
-# Install Ubuntu Server 24.04 LTS, enable OpenSSH during setup.
+# Install Ubuntu Server 26.04 LTS, enable OpenSSH during setup.
 
 # 2. NVIDIA driver + CUDA
 sudo ubuntu-drivers install
@@ -189,7 +189,7 @@ The build above specs AMD (Ryzen 5 7600 / AM5). Intel is a viable swap — the w
 | 24/7 sustained-load reliability | No comparable known issue | 13th/14th gen ("Raptor Lake") had a documented voltage/microcode instability issue under sustained all-core load — largely resolved by 0x129+ microcode/BIOS updates from mid-2024 onward, but worth knowing for an always-on server. Set power limits to Intel spec, not motherboard "enhanced" defaults |
 | Idle power draw | Slightly higher on some boards | Slightly lower — relevant for a 24/7 box |
 
-**Bottom line:** both are x86_64 and behave identically under Ubuntu 24.04 / Docker / NVIDIA driver+CUDA / Ollama / llama.cpp. No software reason to prefer either; the Raptor Lake reliability history is the one real flag, and it's fixable via BIOS updates, not disqualifying.
+**Bottom line:** both are x86_64 and behave identically under Ubuntu 26.04 / Docker / NVIDIA driver+CUDA / Ollama / llama.cpp. No software reason to prefer either; the Raptor Lake reliability history is the one real flag, and it's fixable via BIOS updates, not disqualifying.
 
 ### Cost implication (swapped into the target-tier build, §2)
 
@@ -210,7 +210,7 @@ Going Intel + DDR4 saves roughly **$180–250** off the target build — real mo
 
 ## 9. Minimum OS/software requirements summary
 
-- Ubuntu Server 24.04 LTS, kernel ≥ 6.8
+- Ubuntu Server 26.04 LTS ("Resolute Raccoon"), kernel ≥ 7.0
 - NVIDIA driver ≥ 550, CUDA ≥ 12.4
 - Docker Engine ≥ 26, NVIDIA Container Toolkit
 - WireGuard (or `cloudflared`) for tunnel
