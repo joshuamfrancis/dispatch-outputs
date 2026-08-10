@@ -174,7 +174,41 @@ Keep `docker-compose.yml`, `Caddyfile`, and `authelia/configuration.yml` in a pr
 
 ---
 
-## 8. Minimum OS/software requirements summary
+## 8. CPU platform comparison — AMD vs Intel
+
+The build above specs AMD (Ryzen 5 7600 / AM5). Intel is a viable swap — the workload is GPU-bound, so this is mostly a platform-cost and reliability decision, not a performance one.
+
+### Workload & software fit
+
+| | AMD (Ryzen 7000, AM5) | Intel (Core 14th gen, LGA1700) |
+|---|---|---|
+| Inference throughput impact | Negligible — CPU only handles tokenization, sampling, and any offloaded GGUF layers | Same — negligible |
+| Memory bandwidth (for CPU-offloaded layers) | DDR5 dual-channel | Same with DDR5 board; can also run cheaper DDR4 |
+| PCIe lanes for GPU(s) | PCIe 5.0 x16 (single GPU) or x8/x8 (dual) — plenty for a 5060 Ti class card | Same — PCIe 5.0 x16, x8/x8 available on Z790/B760 |
+| Ubuntu/Docker/CUDA compatibility | Full support, no caveats | Full support, no caveats |
+| 24/7 sustained-load reliability | No comparable known issue | 13th/14th gen ("Raptor Lake") had a documented voltage/microcode instability issue under sustained all-core load — largely resolved by 0x129+ microcode/BIOS updates from mid-2024 onward, but worth knowing for an always-on server. Set power limits to Intel spec, not motherboard "enhanced" defaults |
+| Idle power draw | Slightly higher on some boards | Slightly lower — relevant for a 24/7 box |
+
+**Bottom line:** both are x86_64 and behave identically under Ubuntu 24.04 / Docker / NVIDIA driver+CUDA / Ollama / llama.cpp. No software reason to prefer either; the Raptor Lake reliability history is the one real flag, and it's fixable via BIOS updates, not disqualifying.
+
+### Cost implication (swapped into the target-tier build, §2)
+
+| Component | AMD (as speced) | Intel equivalent |
+|---|---|---|
+| CPU | Ryzen 5 7600 — ≈$290 | Core i5-14600KF — ≈$400–450 (AU pricing has been volatile on stock shortages; historically ranged $245–630) |
+| Motherboard | AM5 B650 — ≈$230 | LGA1700 B760 — ≈$150–180 (mature, cheap platform) |
+| RAM | DDR5-only — ≈$290 for 64GB | Can use DDR4 on B760 (~$180 for 64GB) or DDR5 at similar cost |
+| **Platform total** | **≈$810 (DDR5)** | **≈$550–630 (DDR4) or ≈$680–730 (DDR5)** |
+
+Going Intel + DDR4 saves roughly **$180–250** off the target build — real money against a $2,500 budget, worth redirecting to the 2TB NVMe or UPS line items. Going Intel + DDR5 (to keep a RAM upgrade path) is close to a wash.
+
+**Trade-off beyond price:** AM5 (AMD) is a current platform with a roadmap through Zen5/Zen6 — better upgrade path if you expand this rig later. LGA1700 (Intel) is end-of-life with no future CPU upgrades on that socket, but that matters less here since the GPU is what you'd upgrade for more model headroom anyway.
+
+**Recommendation:** if squeezing the last ~$200 out of the budget matters, Core i5-14600KF + B760 + DDR4 is a legitimate swap with no workload penalty. If you'd rather not think about the Raptor Lake microcode history and want upgrade headroom, stick with Ryzen 5 7600 / AM5 as speced in §2.
+
+---
+
+## 9. Minimum OS/software requirements summary
 
 - Ubuntu Server 24.04 LTS, kernel ≥ 6.8
 - NVIDIA driver ≥ 550, CUDA ≥ 12.4
