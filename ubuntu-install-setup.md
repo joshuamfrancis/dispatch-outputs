@@ -2,7 +2,7 @@
 
 **Target OS:** Ubuntu Desktop 26.04 LTS (codename `resolute`, released 23 Apr 2026)
 **Goal:** Bring a freshly installed desktop to a known-good developer baseline, then capture a Timeshift snapshot of that baseline.
-**Packaging preference:** native `.deb` via APT (Canonical archive first, then vendor APT repos, then vendor `.deb`, then AppImage as last resort). No Snap, no Flatpak.
+**Packaging preference:** native `.deb` via APT (Canonical archive first, then vendor APT repos, then vendor `.deb`, then AppImage as last resort). No Flatpak. Snap is avoided except for Thunderbird and Firefox, which use Ubuntu's defaults — see §10.
 
 ---
 
@@ -14,7 +14,7 @@
 | Python | 26.04 ships **Python 3.14** as `python3`. Do not remove or replace the system Python. |
 | Java | `default-jdk` now points at **OpenJDK 25** (previous LTS default was 21). |
 | Display server | 26.04 is **Wayland-only**. Affects OBS (use PipeWire capture) and global-hotkey apps. |
-| Snap reality check | Ubuntu Desktop 26.04 still uses Snap for App Center, Firefox and Thunderbird's transitional package. This run sheet routes around those with `.deb` alternatives. Fully purging `snapd` is possible but removes App Center — see §13. |
+| Snap reality check | Ubuntu Desktop 26.04 uses Snap for App Center, Firefox and Thunderbird. This run sheet accepts the Mozilla defaults (§10) and routes around Snap everywhere else. Do **not** purge `snapd` on this build — it would break Thunderbird, Firefox and App Center. §10.6 covers switching Mozilla to `.deb` later if you want the option back. |
 | APT keyring dir | Use `/etc/apt/keyrings/` for all third-party keys. Create it once: `sudo install -m 0755 -d /etc/apt/keyrings` |
 | Source format | Prefer the modern deb822 `.sources` format over legacy `.list`. Both work; deb822 is the direction Debian/Ubuntu are moving. |
 
@@ -29,7 +29,7 @@
 7. VS Code
 8. Docker Engine + Compose
 9. Claude Desktop
-10. Thunderbird (+ Firefox) as `.deb`
+10. Thunderbird + Firefox (Ubuntu defaults)
 11. Arduino IDE, draw.io, balenaEtcher, OBS Studio
 12. Proton VPN + RoboForm extension
 13. Verify everything → **take the Timeshift baseline snapshot**
@@ -52,7 +52,19 @@ sudo apt install -y \
 sudo install -m 0755 -d /etc/apt/keyrings
 ```
 
-`gir1.2-ayatanaappindicator3-0.1` plus the **AppIndicator** GNOME extension is what makes tray icons work — Proton VPN, Timeshift and OBS all want it. Enable it in **Extensions → Ubuntu AppIndicators**.
+GNOME has had no system tray since 3.26. Ubuntu rebuilds one from two independent pieces, and both must be present:
+
+- **Host** — `gnome-shell-extension-appindicator`, shown in the Extensions app as **Ubuntu AppIndicators**. It watches D-Bus for StatusNotifierItem registrations and draws them in the top bar. Ships enabled on Ubuntu Desktop, but confirm it — a GNOME version bump can silently mark extensions incompatible, and the symptom is identical to not having it.
+- **Provider typelib** — `gir1.2-ayatanaappindicator3-0.1`, the GObject Introspection metadata that lets Python/GTK apps call the appindicator library at runtime.
+
+The typelib is only needed by **Proton VPN** (§12.1), whose GUI is Python and does `gi.require_version('AyatanaAppIndicator3', '0.1')` — without it that import raises and the tray icon silently never appears, though the app itself runs fine. OBS uses Qt's `QSystemTrayIcon`, which speaks the D-Bus protocol directly, and Timeshift's `.deb` pulls its own dependencies; for both, only the *extension* matters.
+
+Since StatusNotifierItem is a D-Bus protocol rather than the old X11 XEmbed one, it survives 26.04 being Wayland-only.
+
+```bash
+gnome-extensions list --enabled | grep -i appindicator
+gnome-extensions enable ubuntu-appindicators@ubuntu.com   # if missing
+```
 
 Confirm your codename before adding any vendor repo:
 
@@ -223,17 +235,61 @@ Then add the *same* public key to GitHub a second time, this time with key type 
 
 ## 5. Python toolchain
 
-Python 3.14 is already present. Add the developer pieces:
+Python 3.14 is already present as `python3` — but **not** everything you need. Ubuntu splits CPython's stdlib across several `.deb`s, and `venv` is not in the default desktop set. On a stock install:
+
+```
+$ python3 -m venv .venv
+The virtual environment was not created successfully because ensurepip is not
+available.  On Debian/Ubuntu systems, you need to install the python3-venv
+package using the following command.
+
+    apt install python3.14-venv
+```
+
+The `venv` module itself is present; Debian strips out the bundled `ensurepip` (which carries the private pip copy used to seed a new environment) into a separate package. Without it, `venv` builds the directory tree, fails to populate pip, and rolls back.
+
+### Option A — minimal (recommended)
+
+```bash
+sudo apt install -y python3-venv python3-dev
+```
+
+That is the whole real gap. `build-essential` you already have from §1, and it is the other half of what `python3-dev` is for — headers alone are useless without a compiler.
+
+- `python3-venv` — the actual fix. Install the *unversioned* name: it is a metapackage tracking the current default interpreter, so it pulls `python3.14-venv` on 26.04 and will follow the interpreter forward on upgrade.
+- `python3-dev` — CPython headers, needed by any dependency lacking a prebuilt wheel for your platform. You will not need it until an install dies with `fatal error: Python.h: No such file or directory`, and at that moment you need it immediately. Cheap insurance on a machine you are about to snapshot.
+
+Everything else below is convenience, not requirement.
+
+### Option B — full
 
 ```bash
 sudo apt install -y \
-  python3-pip python3-venv python3-dev python3-full \
+  python3-venv python3-dev python3-pip python3-full \
   pipx
 
 pipx ensurepath
 ```
 
 Log out/in (or `source ~/.profile`) so `~/.local/bin` lands on your `PATH`.
+
+| Package | What it buys you | Skip if |
+|---|---|---|
+| `python3-pip` | `pip` usable *outside* a venv | You are strict about venvs — every venv has its own pip regardless |
+| `pipx` | Isolated installs of standalone CLI tools (`ruff`, `poetry`, `uv`) | You install dev tools per-project instead |
+| `python3-full` | Metapackage: venv + pip + dev + tk + full stdlib in one | You prefer to name what you install |
+
+`python3-full` is arguably the simplest single choice if you would rather not think about it — it is a superset of Option A.
+
+### Escape hatch
+
+For the record, this works on a completely stock system:
+
+```bash
+python3 -m venv --without-pip .venv
+```
+
+A genuine isolated environment with no package manager inside it. Occasionally useful for inspecting the seam between `venv` and `ensurepip`; almost never what you actually want.
 
 ### PEP 668 — read this
 
@@ -504,439 +560,39 @@ Review any piped installer before running it. Verify with `claude --version` and
 
 ---
 
-## 10. Thunderbird as a `.deb` (not Snap)
+## 10. Thunderbird and Firefox — Ubuntu defaults
 
-On 24.04 and 26.04 `apt install thunderbird` installs a **transitional package that pulls in the Snap** and reinstalls `snapd`. To get a real `.deb`, use Mozilla's own APT repository and pin it above the Ubuntu archive.
+This section uses Canonical's shipped packages as-is. Both are Snaps on 26.04, which is the one deliberate departure from the no-Snap rule in this run sheet — see the note at the end for what you are trading away and how to reverse it.
 
-### 10.1 Add Mozilla's repo
-
-```bash
-wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- \
-  | sudo tee /etc/apt/keyrings/packages.mozilla.org.asc >/dev/null
-```
-
-Verify the key fingerprint — expect `35BAA0B3 3E9EB396 F59CA838 C0BA5CE6 DC6315A3`:
+### 10.1 Install
 
 ```bash
-gpg -n -q --import --import-options import-show \
-  /etc/apt/keyrings/packages.mozilla.org.asc | awk '/pub/{getline; gsub(/ /,""); print $0}'
-```
-
-```bash
-sudo tee /etc/apt/sources.list.d/mozilla.sources >/dev/null <<'EOF'
-Types: deb
-URIs: https://packages.mozilla.org/apt
-Suites: mozilla
-Components: main
-Architectures: amd64
-Signed-By: /etc/apt/keyrings/packages.mozilla.org.asc
-EOF
-```
-
-### 10.2 Pin Mozilla above Ubuntu — this step is mandatory
-
-Without the pin, Ubuntu's transitional package wins on version number and you get the Snap anyway.
-
-```bash
-sudo tee /etc/apt/preferences.d/mozilla >/dev/null <<'EOF'
-Package: *
-Pin: origin packages.mozilla.org
-Pin-Priority: 1000
-
-Package: firefox*
-Pin: release o=Ubuntu
-Pin-Priority: -1
-
-Package: thunderbird*
-Pin: release o=Ubuntu
-Pin-Priority: -1
-EOF
-```
-
-### 10.3 Remove any Snap versions, then install
-
-```bash
-sudo snap remove --purge thunderbird 2>/dev/null
-sudo snap remove --purge firefox 2>/dev/null
-
 sudo apt update
 sudo apt install -y thunderbird firefox
 ```
 
-Verify you got the real thing:
+Firefox is normally present already on a fresh Ubuntu Desktop install; the command is idempotent, so run it regardless.
+
+Both `apt` names are **transitional packages**. They contain no application — their only job is to invoke `snapd` and install the corresponding Snap. Expect `snapd` activity in the output, and expect it to take noticeably longer than a `.deb` on first run.
+
+### 10.2 Verify
 
 ```bash
-apt policy thunderbird     # Installed version should come from packages.mozilla.org
-which thunderbird          # /usr/bin/thunderbird, not /snap/bin/
-```
-
-> **Alternative:** the `ppa:mozillateam/ppa` Launchpad PPA also ships Thunderbird ESR and Firefox `.deb`s and supports 26.04. Same pinning requirement applies, with `Pin: release o=LP-PPA-mozillateam` / `Pin-Priority: 1001`. Pick one route, not both.
-
-### 10.4 Thunderbird configuration
-
-- Add accounts via **Account Setup**; use OAuth2 where the provider supports it (Gmail, M365).
-- **Settings → General → Config Editor** if you need `mail.server.default.check_all_folders_for_new`.
-- Your profile lives in `~/.thunderbird/` — that is *not* covered by Timeshift. Back it up separately, or use IMAP so the server is the source of truth.
-
----
-
-## 11. Utilities: Arduino IDE, draw.io, balenaEtcher, OBS Studio
-
-### 11.1 Arduino IDE 2.x — AppImage
-
-There is no official `.deb` or APT repo for Arduino IDE 2.x. Upstream ships an x86_64 **AppImage**. This is the one exception to the no-AppImage rule; the Snap is stuck on 1.8.19 and the Flatpak is community-maintained.
-
-```bash
-sudo apt install -y libfuse2t64          # AppImages need FUSE 2
-
-mkdir -p ~/Applications
-cd ~/Applications
-# Grab the current Linux AppImage URL from https://www.arduino.cc/en/software
-wget -O arduino-ide.AppImage "<paste-appimage-url>"
-chmod +x arduino-ide.AppImage
-```
-
-Desktop entry so it appears in the app grid:
-
-```bash
-mkdir -p ~/.local/share/applications
-cat > ~/.local/share/applications/arduino-ide.desktop <<EOF
-[Desktop Entry]
-Type=Application
-Name=Arduino IDE
-Comment=Arduino IDE 2.x
-Exec=$HOME/Applications/arduino-ide.AppImage %U
-Icon=$HOME/Applications/arduino-ide.png
-Terminal=false
-Categories=Development;IDE;Electronics;
-StartupWMClass=Arduino IDE
-EOF
-
-update-desktop-database ~/.local/share/applications
-```
-
-**Serial port access — required, or uploads fail with `Permission denied` on `/dev/ttyACM0`:**
-
-```bash
-sudo usermod -aG dialout $USER
-```
-
-Log out and back in (a full reboot is safest), then `groups` should list `dialout`.
-
-**If a CH340/CH341 clone board is detected but never appears as a port**, the `brltty` braille daemon is claiming it:
-
-```bash
-sudo apt remove -y brltty
-```
-
-Install boards under **Tools → Board → Boards Manager** (ESP32, RP2040, AVR as needed) and libraries under **Tools → Manage Libraries**. Both land in `~/.arduino15/` and `~/Arduino/` — home directory, so not in the Timeshift snapshot.
-
-> **Auto-updating alternative:** `arduino-cli` is a single static binary and is far more script-friendly if you want reproducible board/library installs. Consider it alongside the IDE.
-
-### 11.2 draw.io Desktop — vendor `.deb`
-
-```bash
-cd ~/Downloads
-# Get the current amd64 .deb URL from https://github.com/jgraph/drawio-desktop/releases
-wget -O drawio-amd64.deb "<paste-deb-url>"
-sudo apt install -y ./drawio-amd64.deb
-```
-
-Using `apt install ./file.deb` (rather than `dpkg -i`) resolves dependencies automatically.
-
-No APT repo exists, so updates are manual — check the releases page periodically. Pair it with the `hediet.vscode-drawio` extension from §7 so `.drawio` files open natively in VS Code and version cleanly in Git.
-
-### 11.3 balenaEtcher — vendor `.deb`
-
-```bash
-cd ~/Downloads
-# Get the current amd64 .deb from https://github.com/balena-io/etcher/releases
-wget -O balena-etcher-amd64.deb "<paste-deb-url>"
-sudo apt install -y ./balena-etcher-amd64.deb
-```
-
-If it complains about a missing `libfuse2`, you already installed `libfuse2t64` in §11.1 — otherwise install it now.
-
-> **Lighter alternatives already on your system:** GNOME Disks (`gnome-disk-utility`) has a *Restore Disk Image* function, and `dd`/`cp` write ISOs perfectly well. Etcher's advantage is verification-after-write and refusing to target your system disk.
-
-### 11.4 OBS Studio
-
-In `universe`, so plain APT works:
-
-```bash
-sudo apt install -y obs-studio
-```
-
-For upstream's latest builds instead, use the official PPA:
-
-```bash
-sudo add-apt-repository -y ppa:obsproject/obs-studio
-sudo apt update && sudo apt install -y obs-studio
-```
-
-Virtual camera support:
-
-```bash
-sudo apt install -y v4l2loopback-dkms v4l2loopback-utils
-sudo modprobe v4l2loopback
-echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
-```
-
-**Wayland configuration.** 26.04 has no X11 session, so:
-
-- Use the **Screen Capture (PipeWire)** source, not *Screen Capture (XSHM)*.
-- **Window Capture (PipeWire)** for individual windows.
-- Each capture triggers a portal permission dialog on first use. Enable *Restore token* in the source properties so it doesn't re-prompt every launch.
-- Global hotkeys do not work while OBS is unfocused under Wayland. Use the WebSocket plugin plus an external controller, or a Stream Deck.
-
-Hardware encoding: install `intel-media-va-driver-non-free` (Intel) or `mesa-va-drivers` (AMD) and choose VAAPI in output settings. NVIDIA users get NVENC once the proprietary driver is installed via **Additional Drivers**.
-
----
-
-## 12. Proton VPN and RoboForm
-
-### 12.1 Proton VPN (GUI) — vendor APT repo
-
-Proton publishes a small `.deb` whose only job is to install its repository config and keys.
-
-```bash
-cd ~/Downloads
-wget https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.8_all.deb
-```
-
-Verify the checksum before installing (this is a bootstrap package — do not skip):
-
-```bash
-echo "0b14e71586b22e498eb20926c48c7b434b751149b1f2af9902ef1cfe6b03e180  protonvpn-stable-release_1.0.8_all.deb" | sha256sum --check -
-```
-
-If the version number above has moved on, take the current filename and hash from
-<https://protonvpn.com/support/official-linux-vpn-ubuntu>.
-
-```bash
-sudo dpkg -i ./protonvpn-stable-release_1.0.8_all.deb
-sudo apt update
-sudo apt install -y proton-vpn-gnome-desktop
-```
-
-Tray icon support:
-
-```bash
-sudo apt install -y gir1.2-appindicator3-0.1
-```
-
-Then enable **Ubuntu AppIndicators** in the Extensions app — GNOME has no tray by default.
-
-Split tunnelling needs kernel headers and `systemd-resolved`:
-
-```bash
-sudo apt install -y linux-headers-$(uname -r) systemd-resolved
-```
-
-Reboot, then sign in and set your preferences (protocol, NetShield, Kill Switch, auto-connect).
-
-> **Kill Switch warning:** if you uninstall Proton VPN while the kill switch is active, you lose network access. Disable it *in the app* before removing. Recovery, if you forget: `nmcli connection show` and delete every connection prefixed `pvpn-`.
-
-### 12.2 RoboForm browser extension
-
-RoboForm has **no native Linux desktop client**. On Linux the browser extension runs standalone — full functionality without a desktop app.
-
-1. Open Firefox (the `.deb` from §10) or Chrome.
-2. Go to <https://www.roboform.com/download?os=linux>
-3. Install the extension for your browser (Firefox Add-ons / Chrome Web Store).
-4. Click the RoboForm icon → **Log In** → email + master password → complete 2FA.
-5. Pin the extension to the toolbar.
-6. In Firefox, approve the privacy permission prompt on first click — say yes to both, or filling silently fails.
-
-Consequences of extension-only mode: no offline vault access, no filling of desktop applications, and the *Desktop Editor* view/edit commands are unavailable. Everything web-based works normally.
-
-**If you want Chrome too** (some prefer it for RoboForm):
-
-```bash
-wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
-
-sudo tee /etc/apt/sources.list.d/google-chrome.sources >/dev/null <<'EOF'
-Types: deb
-URIs: https://dl.google.com/linux/chrome/deb/
-Suites: stable
-Components: main
-Architectures: amd64
-Signed-By: /etc/apt/keyrings/google-chrome.gpg
-EOF
-
-sudo apt update && sudo apt install -y google-chrome-stable
-```
-
----
-
-## 13. Verification, then the baseline snapshot
-
-### 13.1 Verification checklist
-
-```bash
-# Repos all resolve cleanly — no 404s, no duplicate-source warnings
-sudo apt update
-
-# Core toolchain
-git --version
-gh --version           && ssh -T git@github.com
-python3 --version      && pipx --version
-java -version          && echo "JAVA_HOME=$JAVA_HOME"
-code --version
-
-# Docker
-docker run --rm hello-world
-docker compose version
-docker info | grep -i "Docker Root Dir"
-
-# Everything that should be a .deb, is
-which thunderbird firefox code claude-desktop obs-studio drawio timeshift
+snap list thunderbird firefox
+which thunderbird firefox        # /snap/bin/... is correct here
 apt policy thunderbird | head -3
-
-# Nothing unexpected arrived via snap
-snap list
-
-# Serial access for Arduino
-groups | grep -o dialout
 ```
 
-Launch each GUI app once — VS Code, Claude Desktop, Thunderbird, Arduino IDE, draw.io, balenaEtcher, OBS, Proton VPN — and complete first-run sign-in / permission prompts. A snapshot taken *after* first-run setup saves you repeating it.
+`which` returning `/snap/bin/thunderbird` confirms the expected outcome. `apt policy` will show the transitional stub's version, which does *not* match the application version — check the real one with `snap list` or **Help → About**.
 
-### 13.2 Record what the snapshot won't cover
+### 10.3 First-run behaviour
 
-Timeshift restores the OS, not your home directory. Write this down somewhere durable:
+Snap-packaged Mozilla apps are confined, which changes a few things you may notice:
 
-| Not in the snapshot | Where it lives | Mitigation |
-|---|---|---|
-| SSH private keys | `~/.ssh/` | Encrypted offline copy |
-| Git config | `~/.gitconfig` | Dotfiles repo on GitHub |
-| VS Code settings/extensions | `~/.config/Code/` | Settings Sync (GitHub) |
-| Thunderbird profile | `~/.thunderbird/` | IMAP + separate backup |
-| Arduino boards/libraries/sketches | `~/.arduino15/`, `~/Arduino/` | Sketches → GitHub |
-| Docker images & volumes | `/var/lib/docker/` (excluded) | Images → Docker Hub; volumes → backup script |
-| Claude Desktop config | `~/.config/Claude/` | Re-sign-in |
-| RoboForm vault | Proton/RoboForm cloud | Nothing to do |
-
-Consider a dotfiles repository — `~/.gitconfig`, `~/.ssh/config`, `~/.bashrc`, VS Code `settings.json` — which turns most of this table into a single `git clone`.
-
-### 13.3 Take the snapshot
-
-```bash
-sudo apt autoremove --purge -y
-sudo apt clean
-sudo journalctl --vacuum-time=1d
-sync
-```
-
-Then:
-
-```bash
-sudo timeshift --create --comments "Post-install baseline: 26.04 + dev stack" --tags D
-```
-
-Or via the GUI: **Timeshift → Create** and comment it clearly.
-
-Verify it exists and note its size:
-
-```bash
-sudo timeshift --list
-```
-
-### 13.4 Test the restore path *before* you need it
-
-An untested backup is a hypothesis. At minimum, confirm that Timeshift's live-boot restore works: boot an Ubuntu live USB, install `timeshift` in the live session, point it at your snapshot device, and confirm the snapshot is listed and selectable. Actually performing the restore is optional — being certain you *could* is not.
-
----
-
-## Appendix A — Consolidated fast path
-
-For a rebuild where you already trust every step above. Run section by section, not blindly as one script.
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-CODENAME=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-ARCH=$(dpkg --print-architecture)
-
-# --- Base -------------------------------------------------------------
-sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y ca-certificates curl wget gnupg apt-transport-https \
-  build-essential pkg-config software-properties-common git git-lfs \
-  unzip zip xz-utils htop tree jq gnome-tweaks \
-  gir1.2-ayatanaappindicator3-0.1 libfuse2t64
-sudo install -m 0755 -d /etc/apt/keyrings
-
-# --- Archive packages -------------------------------------------------
-sudo apt install -y timeshift obs-studio default-jdk maven \
-  python3-pip python3-venv python3-dev python3-full pipx \
-  v4l2loopback-dkms v4l2loopback-utils
-
-# --- VS Code ----------------------------------------------------------
-wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor \
-  | sudo tee /etc/apt/keyrings/packages.microsoft.gpg >/dev/null
-sudo chmod go+r /etc/apt/keyrings/packages.microsoft.gpg
-printf 'Types: deb\nURIs: https://packages.microsoft.com/repos/code\nSuites: stable\nComponents: main\nArchitectures: amd64 arm64 armhf\nSigned-By: /etc/apt/keyrings/packages.microsoft.gpg\n' \
-  | sudo tee /etc/apt/sources.list.d/vscode.sources >/dev/null
-
-# --- Docker -----------------------------------------------------------
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
-  "$CODENAME" "$ARCH" | sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null
-
-# --- Claude Desktop ---------------------------------------------------
-sudo curl -fsSLo /etc/apt/keyrings/claude-desktop-archive-keyring.asc \
-  https://downloads.claude.ai/claude-desktop/key.asc
-printf 'Types: deb\nURIs: https://downloads.claude.ai/claude-desktop/apt/stable\nSuites: stable\nComponents: main\nArchitectures: amd64 arm64\nSigned-By: /etc/apt/keyrings/claude-desktop-archive-keyring.asc\n' \
-  | sudo tee /etc/apt/sources.list.d/claude-desktop.sources >/dev/null
-
-# --- Mozilla ----------------------------------------------------------
-wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- \
-  | sudo tee /etc/apt/keyrings/packages.mozilla.org.asc >/dev/null
-printf 'Types: deb\nURIs: https://packages.mozilla.org/apt\nSuites: mozilla\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/packages.mozilla.org.asc\n' \
-  | sudo tee /etc/apt/sources.list.d/mozilla.sources >/dev/null
-printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n\nPackage: firefox*\nPin: release o=Ubuntu\nPin-Priority: -1\n\nPackage: thunderbird*\nPin: release o=Ubuntu\nPin-Priority: -1\n' \
-  | sudo tee /etc/apt/preferences.d/mozilla >/dev/null
-
-# --- Install everything from the new repos ----------------------------
-sudo apt update
-sudo apt install -y code \
-  docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
-  claude-desktop thunderbird firefox
-sudo rm -f /etc/apt/sources.list.d/claude-desktop.list \
-           /usr/share/keyrings/claude-desktop-archive-keyring.asc
-
-# --- Groups -----------------------------------------------------------
-sudo usermod -aG docker,dialout "$USER"
-pipx ensurepath
-
-echo "Done. Log out and back in, then continue with the manual .deb/AppImage steps."
-```
-
-Still manual after this: Arduino IDE AppImage, draw.io `.deb`, balenaEtcher `.deb`, Proton VPN bootstrap `.deb`, RoboForm extension, SSH key generation, and all first-run sign-ins.
-
----
-
-## Appendix B — Post-snapshot maintenance
-
-```bash
-# Everything from APT, in one command
-sudo apt update && sudo apt full-upgrade -y
-
-# What has an update pending
-apt list --upgradable
-```
-
-Manual-update items, since they have no APT repo — check quarterly:
-
-- Arduino IDE (AppImage) — <https://www.arduino.cc/en/software>
-- draw.io Desktop — <https://github.com/jgraph/drawio-desktop/releases>
-- balenaEtcher — <https://github.com/balena-io/etcher/releases>
-
-Before any risky change (kernel testing, driver swap, major version bump), take an on-demand snapshot first:
-
-```bash
-sudo timeshift --create --comments "Before <change>" --tags O
-```
+| Behaviour | Why |
+|---|---|
+| Slow first launch after install or update | Snap decompresses and sets up the mount namespace once |
+| File dialogs limited to `~/`, `/media`, `/run/media` | Confinement. Use the XDG portal dialog, or `snap connect` extra interfaces |
+| Cannot attach files from `/tmp` or arbitrary system paths | Same — copy into `~/` first |
+| GPG/Enigmail smartcard readers may not be seen | Hardware interfaces need explicit connection |
+| Profiles live in `~/snap/thunderbird/common/
