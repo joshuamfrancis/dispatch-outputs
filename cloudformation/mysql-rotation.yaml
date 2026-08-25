@@ -1,169 +1,86 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Windows EC2 with MySQL, Secrets Manager secret, and VPC-attached Lambda
-  rotation function. Includes CloudTrail audit trail for secret events.
+  Windows EC2 (MySQL pre-installed manually), Secrets Manager secret, VPC-attached
+  Lambda rotation function, Secrets Manager VPC Interface Endpoint, and CloudTrail
+  audit trail. Requires a pre-existing VPC and subnets.
 
 # ================================================================
 # PARAMETERS
 # ================================================================
 Parameters:
 
-  VpcCidr:
-    Type: String
-    Default: 10.0.0.0/16
+  # ── Pre-existing network ────────────────────────────────────────
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the existing VPC
 
-  PublicSubnetCidr:
-    Type: String
-    Default: 10.0.1.0/24
+  EC2SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for the Windows EC2 instance (must have a route to the internet for RDP if needed)
 
-  PrivateSubnetCidr:
-    Type: String
-    Default: 10.0.2.0/24
+  LambdaSubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First private subnet for the Lambda rotation function
 
+  LambdaSubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second private subnet for the Lambda rotation function (different AZ)
+
+  # ── EC2 ──────────────────────────────────────────────────────────
   WindowsAMI:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
-    Description: Latest Windows Server 2022 AMI from SSM Parameter Store
+    Description: Windows Server 2022 AMI resolved from SSM Parameter Store
 
   InstanceType:
     Type: String
     Default: t3.medium
     AllowedValues: [t3.medium, t3.large, m5.large]
 
+  # ── MySQL credentials ────────────────────────────────────────────
   DBUsername:
     Type: String
     Default: appadmin
-    Description: MySQL application username
+    Description: MySQL application username (must already exist on the MySQL instance)
 
   DBPassword:
     Type: String
     NoEcho: true
     MinLength: 12
-    Description: Initial MySQL password (will be rotated by Lambda)
+    Description: >
+      Initial MySQL password stored in Secrets Manager.
+      MySQL must already be installed and this user must exist on the EC2 instance.
 
   DBName:
     Type: String
     Default: appdb
     Description: MySQL database name
 
+  MySQLPort:
+    Type: Number
+    Default: 3306
+    Description: MySQL listening port on the EC2 instance
+
+  # ── Lambda ───────────────────────────────────────────────────────
   PyMySQLLayerArn:
     Type: String
     Description: >
       ARN of a Lambda Layer containing PyMySQL.
-      Create one with: pip install pymysql -t python/ && zip -r pymysql-layer.zip python/
-      then upload to Lambda Layers, or use a community layer for your region.
+      Build with: pip install pymysql -t python/ && zip -r pymysql-layer.zip python/
+      then: aws lambda publish-layer-version --layer-name pymysql
+            --compatible-runtimes python3.12 --zip-file fileb://pymysql-layer.zip
 
   RotationIntervalDays:
     Type: Number
     Default: 30
     MinValue: 1
     MaxValue: 365
-    Description: How often (in days) to automatically rotate the secret
+    Description: Automatic rotation frequency in days
 
 # ================================================================
 # RESOURCES
 # ================================================================
 Resources:
-
-  # ---------------------------------------------------------------
-  # VPC & Networking
-  # ---------------------------------------------------------------
-
-  VPC:
-    Type: AWS::EC2::VPC
-    Properties:
-      CidrBlock: !Ref VpcCidr
-      EnableDnsHostnames: true
-      EnableDnsSupport: true
-      Tags:
-        - Key: Name
-          Value: !Sub ${AWS::StackName}-vpc
-
-  PublicSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: !Ref PublicSubnetCidr
-      AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: true
-      Tags:
-        - Key: Name
-          Value: !Sub ${AWS::StackName}-public-subnet
-
-  PrivateSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: !Ref PrivateSubnetCidr
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: !Sub ${AWS::StackName}-private-subnet
-
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-    Properties:
-      Tags:
-        - Key: Name
-          Value: !Sub ${AWS::StackName}-igw
-
-  IGWAttachment:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref VPC
-      InternetGatewayId: !Ref InternetGateway
-
-  PublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref VPC
-
-  PublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: IGWAttachment
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-
-  PublicSubnetRouteAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref PublicRouteTable
-
-  # NAT Gateway: allows Lambda in private subnet to reach Secrets Manager
-  NATGWEIP:
-    Type: AWS::EC2::EIP
-    Properties:
-      Domain: vpc
-
-  NATGateway:
-    Type: AWS::EC2::NatGateway
-    Properties:
-      AllocationId: !GetAtt NATGWEIP.AllocationId
-      SubnetId: !Ref PublicSubnet
-      Tags:
-        - Key: Name
-          Value: !Sub ${AWS::StackName}-natgw
-
-  PrivateRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref VPC
-
-  PrivateRoute:
-    Type: AWS::EC2::Route
-    Properties:
-      RouteTableId: !Ref PrivateRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NATGateway
-
-  PrivateSubnetRouteAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PrivateSubnet
-      RouteTableId: !Ref PrivateRouteTable
 
   # ---------------------------------------------------------------
   # Security Groups
@@ -172,19 +89,19 @@ Resources:
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Windows EC2 MySQL instance
-      VpcId: !Ref VPC
+      GroupDescription: Windows EC2 MySQL — allows MySQL from Lambda rotation function
+      VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 3306
-          ToPort: 3306
+          FromPort: !Ref MySQLPort
+          ToPort: !Ref MySQLPort
           SourceSecurityGroupId: !Ref LambdaSecurityGroup
-          Description: MySQL access from Lambda rotation function only
+          Description: MySQL from Lambda rotation function only
         - IpProtocol: tcp
           FromPort: 3389
           ToPort: 3389
           CidrIp: 0.0.0.0/0
-          Description: RDP — RESTRICT TO YOUR IP IN PRODUCTION
+          Description: RDP — RESTRICT TO YOUR ADMIN IP IN PRODUCTION
       Tags:
         - Key: Name
           Value: !Sub ${AWS::StackName}-ec2-sg
@@ -193,21 +110,56 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Lambda secret rotation function
-      VpcId: !Ref VPC
+      VpcId: !Ref VpcId
       SecurityGroupEgress:
         - IpProtocol: tcp
-          FromPort: 3306
-          ToPort: 3306
+          FromPort: !Ref MySQLPort
+          ToPort: !Ref MySQLPort
           DestinationSecurityGroupId: !Ref EC2SecurityGroup
-          Description: MySQL to EC2
+          Description: MySQL to EC2 instance
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS to Secrets Manager via NAT Gateway
+          DestinationSecurityGroupId: !Ref SecretsManagerEndpointSG
+          Description: HTTPS to Secrets Manager VPC endpoint
       Tags:
         - Key: Name
           Value: !Sub ${AWS::StackName}-lambda-sg
+
+  # Security group attached to the Secrets Manager VPC Interface Endpoint
+  SecretsManagerEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Secrets Manager VPC Interface Endpoint
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: Allow Lambda to call Secrets Manager via endpoint
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-secretsmanager-endpoint-sg
+
+  # ---------------------------------------------------------------
+  # Secrets Manager VPC Interface Endpoint
+  # Allows Lambda in private subnets to reach Secrets Manager
+  # without traversing the internet or requiring a NAT Gateway.
+  # ---------------------------------------------------------------
+
+  SecretsManagerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref LambdaSubnetId1
+        - !Ref LambdaSubnetId2
+      SecurityGroupIds:
+        - !Ref SecretsManagerEndpointSG
+      PrivateDnsEnabled: true
 
   # ---------------------------------------------------------------
   # EC2 IAM Role & Instance Profile
@@ -244,7 +196,9 @@ Resources:
         - !Ref EC2InstanceRole
 
   # ---------------------------------------------------------------
-  # EC2 Windows Instance with MySQL
+  # Windows EC2 Instance
+  # NOTE: MySQL installation is a manual post-provisioning step.
+  # The UserData only signals CloudFormation success.
   # ---------------------------------------------------------------
 
   EC2Instance:
@@ -252,7 +206,7 @@ Resources:
     Properties:
       ImageId: !Ref WindowsAMI
       InstanceType: !Ref InstanceType
-      SubnetId: !Ref PublicSubnet
+      SubnetId: !Ref EC2SubnetId
       SecurityGroupIds:
         - !Ref EC2SecurityGroup
       IamInstanceProfile: !Ref EC2InstanceProfile
@@ -266,46 +220,10 @@ Resources:
         Fn::Base64:
           Fn::Sub: |
             <powershell>
-            # Install Chocolatey package manager
-            Set-ExecutionPolicy Bypass -Scope Process -Force
-            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-            iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-
-            # Install MySQL 8.0
-            choco install mysql --version=8.0.36 -y --no-progress
-
-            # Update PATH for this session
-            $mysqlBin = "C:\Program Files\MySQL\MySQL Server 8.0\bin"
-            $env:Path += ";$mysqlBin"
-            [Environment]::SetEnvironmentVariable("Path", $env:Path, "Machine")
-
-            # Wait for MySQL service to be ready
-            Start-Sleep -Seconds 45
-
-            # Set a temporary root password and configure the app user
-            $tmpRoot = "TmpR00t!$(Get-Random -Maximum 9999)"
-            & "$mysqlBin\mysql.exe" -u root --connect-expired-password -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$tmpRoot';"
-            & "$mysqlBin\mysql.exe" -u root -p"$tmpRoot" -e "CREATE DATABASE IF NOT EXISTS ${DBName} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-            & "$mysqlBin\mysql.exe" -u root -p"$tmpRoot" -e "CREATE USER IF NOT EXISTS '${DBUsername}'@'%' IDENTIFIED BY '${DBPassword}';"
-            & "$mysqlBin\mysql.exe" -u root -p"$tmpRoot" -e "GRANT ALL PRIVILEGES ON ${DBName}.* TO '${DBUsername}'@'%';"
-            & "$mysqlBin\mysql.exe" -u root -p"$tmpRoot" -e "FLUSH PRIVILEGES;"
-
-            # Allow MySQL to accept remote connections (bind to all interfaces)
-            $myIni = "C:\ProgramData\MySQL\MySQL Server 8.0\my.ini"
-            if (Test-Path $myIni) {
-              (Get-Content $myIni) -replace '^bind-address\s*=.*', 'bind-address=0.0.0.0' | Set-Content $myIni
-            }
-
-            # Restart MySQL to apply networking changes
-            Restart-Service -Name MySQL80 -Force
-
-            # Open MySQL port in Windows Firewall
-            New-NetFirewallRule -DisplayName "MySQL 3306" -Direction Inbound -Protocol TCP -LocalPort 3306 -Action Allow
-
-            # Signal CloudFormation success
-            cfn-signal.exe -e $LASTEXITCODE --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
-
-            Write-Host "MySQL setup complete."
+            # Signal CloudFormation that the instance is ready.
+            # MySQL must be installed and configured manually after launch.
+            cfn-signal.exe -e 0 --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+            Write-Host "EC2 instance ready. Install and configure MySQL manually."
             </powershell>
       Tags:
         - Key: Name
@@ -313,7 +231,7 @@ Resources:
         - Key: OS
           Value: Windows
         - Key: Role
-          Value: MySQL
+          Value: MySQL-Host
 
   # ---------------------------------------------------------------
   # Secrets Manager Secret
@@ -323,13 +241,15 @@ Resources:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub ${AWS::StackName}/mysql/credentials
-      Description: MySQL credentials for Windows EC2 instance — rotated by Lambda
+      Description: >
+        MySQL credentials for Windows EC2 instance.
+        Rotated automatically by the Lambda rotation function.
       SecretString: !Sub |
         {
           "username": "${DBUsername}",
           "password": "${DBPassword}",
           "host": "${EC2Instance.PrivateIp}",
-          "port": 3306,
+          "port": ${MySQLPort},
           "dbname": "${DBName}",
           "engine": "mysql"
         }
@@ -388,7 +308,7 @@ Resources:
                 Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-secret-rotation:*
 
   # ---------------------------------------------------------------
-  # CloudWatch Log Group (pre-created for Lambda)
+  # CloudWatch Log Group for Lambda
   # ---------------------------------------------------------------
 
   LambdaLogGroup:
@@ -398,7 +318,7 @@ Resources:
       RetentionInDays: 90
 
   # ---------------------------------------------------------------
-  # Lambda Rotation Function (VPC-attached)
+  # Lambda Rotation Function (VPC-attached, private subnets)
   # ---------------------------------------------------------------
 
   RotationLambda:
@@ -413,10 +333,11 @@ Resources:
       Timeout: 60
       MemorySize: 128
       Layers:
-        - !Ref PyMySQLLayerArn   # Must supply a layer containing pymysql
+        - !Ref PyMySQLLayerArn
       VpcConfig:
         SubnetIds:
-          - !Ref PrivateSubnet
+          - !Ref LambdaSubnetId1
+          - !Ref LambdaSubnetId2
         SecurityGroupIds:
           - !Ref LambdaSecurityGroup
       Environment:
@@ -483,9 +404,7 @@ Resources:
               dispatch[step](client, secret_arn, token)
 
 
-          # ── Step 1 ────────────────────────────────────────────────────────────────
           def create_secret(client, arn, token):
-              """Generate a new password and store it as AWSPENDING."""
               try:
                   client.get_secret_value(SecretId=arn, VersionStage='AWSPENDING',
                                           VersionId=token)
@@ -506,9 +425,7 @@ Resources:
               logger.info("createSecret: AWSPENDING version stored.")
 
 
-          # ── Step 2 ────────────────────────────────────────────────────────────────
           def set_secret(client, arn, token):
-              """Apply the AWSPENDING password to MySQL."""
               pending = _get_secret(client, arn, 'AWSPENDING', token)
               current = _get_secret(client, arn, 'AWSCURRENT')
 
@@ -527,9 +444,7 @@ Resources:
                   conn.close()
 
 
-          # ── Step 3 ────────────────────────────────────────────────────────────────
           def test_secret(client, arn, token):
-              """Verify the AWSPENDING credentials connect to MySQL successfully."""
               pending = _get_secret(client, arn, 'AWSPENDING', token)
               conn = _connect(pending)
               try:
@@ -540,9 +455,7 @@ Resources:
                   conn.close()
 
 
-          # ── Step 4 ────────────────────────────────────────────────────────────────
           def finish_secret(client, arn, token):
-              """Promote AWSPENDING to AWSCURRENT."""
               metadata = client.describe_secret(SecretId=arn)
               old_current = next(
                   v for v, stages in metadata['VersionIdsToStages'].items()
@@ -560,7 +473,6 @@ Resources:
               logger.info("finishSecret: AWSCURRENT promoted to version %s.", token)
 
 
-          # ── Helpers ───────────────────────────────────────────────────────────────
           def _get_secret(client, arn, stage, version_id=None):
               kwargs = {'SecretId': arn, 'VersionStage': stage}
               if version_id:
@@ -604,7 +516,7 @@ Resources:
       SourceAccount: !Ref AWS::AccountId
 
   # ---------------------------------------------------------------
-  # CloudTrail Audit Trail (captures all Secrets Manager API calls)
+  # CloudTrail Audit Trail
   # ---------------------------------------------------------------
 
   AuditTrailBucket:
@@ -682,9 +594,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub ${AWS::StackName}-rotation-failure
-      AlarmDescription: >
-        Lambda rotation function threw an error during secret rotation.
-        Check /aws/lambda/${AWS::StackName}-secret-rotation for details.
+      AlarmDescription: Lambda rotation function threw an error during secret rotation.
       MetricName: Errors
       Namespace: AWS/Lambda
       Dimensions:
@@ -712,10 +622,6 @@ Outputs:
     Description: EC2 Private IP (stored in secret host field)
     Value: !GetAtt EC2Instance.PrivateIp
 
-  EC2PublicIP:
-    Description: EC2 Public IP (for RDP — restrict SG to your IP)
-    Value: !GetAtt EC2Instance.PublicIp
-
   SecretARN:
     Description: Secrets Manager Secret ARN
     Value: !Ref MySQLSecret
@@ -734,10 +640,10 @@ Outputs:
     Description: CloudWatch Log Group for rotation Lambda
     Value: !Ref LambdaLogGroup
 
+  SecretsManagerVPCEndpointId:
+    Description: Secrets Manager VPC Interface Endpoint ID
+    Value: !Ref SecretsManagerVPCEndpoint
+
   AuditTrailBucket:
     Description: S3 bucket storing CloudTrail audit logs
     Value: !Ref AuditTrailBucket
-
-  CloudTrailName:
-    Description: CloudTrail trail name
-    Value: !Ref SecretsAuditTrail
