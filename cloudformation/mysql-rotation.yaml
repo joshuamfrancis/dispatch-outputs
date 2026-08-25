@@ -1,0 +1,743 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Windows EC2 with MySQL, Secrets Manager secret, and VPC-attached Lambda
+  rotation function. Includes CloudTrail audit trail for secret events.
+
+# ================================================================
+# PARAMETERS
+# ================================================================
+Parameters:
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.2.0/24
+
+  WindowsAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+    Description: Latest Windows Server 2022 AMI from SSM Parameter Store
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.medium, t3.large, m5.large]
+
+  DBUsername:
+    Type: String
+    Default: appadmin
+    Description: MySQL application username
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Initial MySQL password (will be rotated by Lambda)
+
+  DBName:
+    Type: String
+    Default: appdb
+    Description: MySQL database name
+
+  PyMySQLLayerArn:
+    Type: String
+    Description: >
+      ARN of a Lambda Layer containing PyMySQL.
+      Create one with: pip install pymysql -t python/ && zip -r pymysql-layer.zip python/
+      then upload to Lambda Layers, or use a community layer for your region.
+
+  RotationIntervalDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: How often (in days) to automatically rotate the secret
+
+# ================================================================
+# RESOURCES
+# ================================================================
+Resources:
+
+  # ---------------------------------------------------------------
+  # VPC & Networking
+  # ---------------------------------------------------------------
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # NAT Gateway: allows Lambda in private subnet to reach Secrets Manager
+  NATGWEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGWEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-natgw
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Windows EC2 MySQL instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: MySQL access from Lambda rotation function only
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0
+          Description: RDP — RESTRICT TO YOUR IP IN PRODUCTION
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ec2-sg
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda secret rotation function
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          DestinationSecurityGroupId: !Ref EC2SecurityGroup
+          Description: MySQL to EC2
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to Secrets Manager via NAT Gateway
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-lambda-sg
+
+  # ---------------------------------------------------------------
+  # EC2 IAM Role & Instance Profile
+  # ---------------------------------------------------------------
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadMySQLSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}/mysql/*
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ---------------------------------------------------------------
+  # EC2 Windows Instance with MySQL
+  # ---------------------------------------------------------------
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref WindowsAMI
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 60
+            VolumeType: gp3
+            Encrypted: true
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            <powershell>
+            # Install Chocolatey package manager
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+            iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+            # Install MySQL 8.0
+            choco install mysql --version=8.0.36 -y --no-progress
+
+            # Update PATH for this session
+            $mysqlBin = "C:\Program Files\MySQL\MySQL Server 8.0\bin"
+            $env:Path += ";$mysqlBin"
+            [Environment]::SetEnvironmentVariable("Path", $env:Path, "Machine")
+
+            # Wait for MySQL service to be ready
+            Start-Sleep -Seconds 45
+
+            # Set a temporary root password and configure the app user
+            $tmpRoot = "TmpR00t!$(Get-Random -Maximum 9999)"
+            & "$mysqlBin\mysql.exe" -u root --connect-expired-password -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$tmpRoot';"
+            & "$mysqlBin\mysql.exe" -u root -p"$tmpRoot" -e "CREATE DATABASE IF NOT EXISTS ${DBName} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+            & "$mysqlBin\mysql.exe" -u root -p"$tmpRoot" -e "CREATE USER IF NOT EXISTS '${DBUsername}'@'%' IDENTIFIED BY '${DBPassword}';"
+            & "$mysqlBin\mysql.exe" -u root -p"$tmpRoot" -e "GRANT ALL PRIVILEGES ON ${DBName}.* TO '${DBUsername}'@'%';"
+            & "$mysqlBin\mysql.exe" -u root -p"$tmpRoot" -e "FLUSH PRIVILEGES;"
+
+            # Allow MySQL to accept remote connections (bind to all interfaces)
+            $myIni = "C:\ProgramData\MySQL\MySQL Server 8.0\my.ini"
+            if (Test-Path $myIni) {
+              (Get-Content $myIni) -replace '^bind-address\s*=.*', 'bind-address=0.0.0.0' | Set-Content $myIni
+            }
+
+            # Restart MySQL to apply networking changes
+            Restart-Service -Name MySQL80 -Force
+
+            # Open MySQL port in Windows Firewall
+            New-NetFirewallRule -DisplayName "MySQL 3306" -Direction Inbound -Protocol TCP -LocalPort 3306 -Action Allow
+
+            # Signal CloudFormation success
+            cfn-signal.exe -e $LASTEXITCODE --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+
+            Write-Host "MySQL setup complete."
+            </powershell>
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-windows-mysql
+        - Key: OS
+          Value: Windows
+        - Key: Role
+          Value: MySQL
+
+  # ---------------------------------------------------------------
+  # Secrets Manager Secret
+  # ---------------------------------------------------------------
+
+  MySQLSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/mysql/credentials
+      Description: MySQL credentials for Windows EC2 instance — rotated by Lambda
+      SecretString: !Sub |
+        {
+          "username": "${DBUsername}",
+          "password": "${DBPassword}",
+          "host": "${EC2Instance.PrivateIp}",
+          "port": 3306,
+          "dbname": "${DBName}",
+          "engine": "mysql"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-mysql-secret
+        - Key: ManagedBy
+          Value: SecretsManager
+
+  SecretRotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: LambdaInvokePermission
+    Properties:
+      SecretId: !Ref MySQLSecret
+      RotationLambdaARN: !GetAtt RotationLambda.Arn
+      RotationRules:
+        AutomaticallyAfterDays: !Ref RotationIntervalDays
+
+  # ---------------------------------------------------------------
+  # Lambda IAM Execution Role
+  # ---------------------------------------------------------------
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda-rotation-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Grants CreateNetworkInterface / DeleteNetworkInterface for VPC attachment
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerRotation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowSecretAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:UpdateSecretVersionStage
+                Resource: !Ref MySQLSecret
+              - Sid: AllowCloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-secret-rotation:*
+
+  # ---------------------------------------------------------------
+  # CloudWatch Log Group (pre-created for Lambda)
+  # ---------------------------------------------------------------
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-secret-rotation
+      RetentionInDays: 90
+
+  # ---------------------------------------------------------------
+  # Lambda Rotation Function (VPC-attached)
+  # ---------------------------------------------------------------
+
+  RotationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-secret-rotation
+      Description: Four-step Secrets Manager rotation for MySQL on Windows EC2
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Layers:
+        - !Ref PyMySQLLayerArn   # Must supply a layer containing pymysql
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          AWS_REGION_NAME: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          """
+          Secrets Manager four-step rotation for MySQL.
+          Requires a Lambda Layer with pymysql installed.
+
+          Steps:
+            1. createSecret  - generate new password, store as AWSPENDING
+            2. setSecret     - apply new password to MySQL
+            3. testSecret    - verify new credentials connect
+            4. finishSecret  - promote AWSPENDING to AWSCURRENT
+          """
+          import boto3
+          import json
+          import logging
+          import os
+          import secrets
+          import string
+
+          import pymysql
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          REGION = os.environ.get('AWS_REGION_NAME', 'us-east-1')
+
+
+          def handler(event, context):
+              secret_arn = event['SecretId']
+              token      = event['ClientRequestToken']
+              step       = event['Step']
+
+              client = boto3.client('secretsmanager', region_name=REGION)
+
+              metadata = client.describe_secret(SecretId=secret_arn)
+
+              if not metadata.get('RotationEnabled', False):
+                  raise ValueError(f"Rotation is not enabled for secret {secret_arn}")
+
+              versions = metadata.get('VersionIdsToStages', {})
+              if token not in versions:
+                  raise ValueError(f"Version {token} not found in secret {secret_arn}")
+              if 'AWSCURRENT' in versions[token]:
+                  logger.info("Version %s is already AWSCURRENT — no action needed.", token)
+                  return
+              if 'AWSPENDING' not in versions[token]:
+                  raise ValueError(f"Version {token} is not in AWSPENDING stage")
+
+              dispatch = {
+                  'createSecret': create_secret,
+                  'setSecret':    set_secret,
+                  'testSecret':   test_secret,
+                  'finishSecret': finish_secret,
+              }
+              if step not in dispatch:
+                  raise ValueError(f"Unknown rotation step: {step}")
+
+              logger.info("Executing step: %s for secret: %s", step, secret_arn)
+              dispatch[step](client, secret_arn, token)
+
+
+          # ── Step 1 ────────────────────────────────────────────────────────────────
+          def create_secret(client, arn, token):
+              """Generate a new password and store it as AWSPENDING."""
+              try:
+                  client.get_secret_value(SecretId=arn, VersionStage='AWSPENDING',
+                                          VersionId=token)
+                  logger.info("AWSPENDING already exists — skipping createSecret.")
+                  return
+              except client.exceptions.ResourceNotFoundException:
+                  pass
+
+              current = _get_secret(client, arn, 'AWSCURRENT')
+              current['password'] = _generate_password()
+
+              client.put_secret_value(
+                  SecretId=arn,
+                  ClientRequestToken=token,
+                  SecretString=json.dumps(current),
+                  VersionStages=['AWSPENDING'],
+              )
+              logger.info("createSecret: AWSPENDING version stored.")
+
+
+          # ── Step 2 ────────────────────────────────────────────────────────────────
+          def set_secret(client, arn, token):
+              """Apply the AWSPENDING password to MySQL."""
+              pending = _get_secret(client, arn, 'AWSPENDING', token)
+              current = _get_secret(client, arn, 'AWSCURRENT')
+
+              conn = _connect(current)
+              try:
+                  with conn.cursor() as cur:
+                      cur.execute(
+                          "ALTER USER %s@'%%' IDENTIFIED BY %s",
+                          (pending['username'], pending['password']),
+                      )
+                      cur.execute("FLUSH PRIVILEGES")
+                  conn.commit()
+                  logger.info("setSecret: MySQL password updated for user '%s'.",
+                              pending['username'])
+              finally:
+                  conn.close()
+
+
+          # ── Step 3 ────────────────────────────────────────────────────────────────
+          def test_secret(client, arn, token):
+              """Verify the AWSPENDING credentials connect to MySQL successfully."""
+              pending = _get_secret(client, arn, 'AWSPENDING', token)
+              conn = _connect(pending)
+              try:
+                  with conn.cursor() as cur:
+                      cur.execute("SELECT 1")
+                  logger.info("testSecret: new credentials verified — connection successful.")
+              finally:
+                  conn.close()
+
+
+          # ── Step 4 ────────────────────────────────────────────────────────────────
+          def finish_secret(client, arn, token):
+              """Promote AWSPENDING to AWSCURRENT."""
+              metadata = client.describe_secret(SecretId=arn)
+              old_current = next(
+                  v for v, stages in metadata['VersionIdsToStages'].items()
+                  if 'AWSCURRENT' in stages
+              )
+              if old_current == token:
+                  logger.info("finishSecret: version already AWSCURRENT.")
+                  return
+              client.update_secret_version_stage(
+                  SecretId=arn,
+                  VersionStage='AWSCURRENT',
+                  MoveToVersionId=token,
+                  RemoveFromVersionId=old_current,
+              )
+              logger.info("finishSecret: AWSCURRENT promoted to version %s.", token)
+
+
+          # ── Helpers ───────────────────────────────────────────────────────────────
+          def _get_secret(client, arn, stage, version_id=None):
+              kwargs = {'SecretId': arn, 'VersionStage': stage}
+              if version_id:
+                  kwargs['VersionId'] = version_id
+              return json.loads(client.get_secret_value(**kwargs)['SecretString'])
+
+
+          def _connect(secret):
+              return pymysql.connect(
+                  host=secret['host'],
+                  port=int(secret.get('port', 3306)),
+                  user=secret['username'],
+                  password=secret['password'],
+                  database=secret.get('dbname', ''),
+                  connect_timeout=10,
+                  cursorclass=pymysql.cursors.DictCursor,
+              )
+
+
+          def _generate_password(length=32):
+              special = '!#$%&*+-=?@^_'
+              alphabet = string.ascii_letters + string.digits + special
+              while True:
+                  pwd = ''.join(secrets.choice(alphabet) for _ in range(length))
+                  if (any(c.islower() for c in pwd)
+                          and any(c.isupper() for c in pwd)
+                          and any(c.isdigit() for c in pwd)
+                          and any(c in special for c in pwd)):
+                      return pwd
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-rotation-lambda
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RotationLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: secretsmanager.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------
+  # CloudTrail Audit Trail (captures all Secrets Manager API calls)
+  # ---------------------------------------------------------------
+
+  AuditTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-audit-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveToGlacierAfter90Days
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: DeleteAfter7Years
+            Status: Enabled
+            ExpirationInDays: 2555
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  AuditTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AuditTrailBucket.Arn
+          - Sid: AllowCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${AuditTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  SecretsAuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: AuditTrailBucketPolicy
+    Properties:
+      TrailName: !Sub ${AWS::StackName}-secrets-audit-trail
+      S3BucketName: !Ref AuditTrailBucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: false
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-secrets-audit-trail
+
+  # ---------------------------------------------------------------
+  # CloudWatch Alarm — rotation failures
+  # ---------------------------------------------------------------
+
+  RotationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-rotation-failure
+      AlarmDescription: >
+        Lambda rotation function threw an error during secret rotation.
+        Check /aws/lambda/${AWS::StackName}-secret-rotation for details.
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RotationLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ================================================================
+# OUTPUTS
+# ================================================================
+Outputs:
+
+  EC2InstanceId:
+    Description: EC2 Windows Instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub ${AWS::StackName}-ec2-id
+
+  EC2PrivateIP:
+    Description: EC2 Private IP (stored in secret host field)
+    Value: !GetAtt EC2Instance.PrivateIp
+
+  EC2PublicIP:
+    Description: EC2 Public IP (for RDP — restrict SG to your IP)
+    Value: !GetAtt EC2Instance.PublicIp
+
+  SecretARN:
+    Description: Secrets Manager Secret ARN
+    Value: !Ref MySQLSecret
+    Export:
+      Name: !Sub ${AWS::StackName}-secret-arn
+
+  SecretName:
+    Description: Secrets Manager Secret Name
+    Value: !Sub ${AWS::StackName}/mysql/credentials
+
+  RotationLambdaARN:
+    Description: Rotation Lambda function ARN
+    Value: !GetAtt RotationLambda.Arn
+
+  LambdaLogGroup:
+    Description: CloudWatch Log Group for rotation Lambda
+    Value: !Ref LambdaLogGroup
+
+  AuditTrailBucket:
+    Description: S3 bucket storing CloudTrail audit logs
+    Value: !Ref AuditTrailBucket
+
+  CloudTrailName:
+    Description: CloudTrail trail name
+    Value: !Ref SecretsAuditTrail
